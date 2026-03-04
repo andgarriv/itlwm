@@ -222,7 +222,8 @@ ieee80211_disable_wep(struct ieee80211com *ic)
 void
 ieee80211_disable_rsn(struct ieee80211com *ic)
 {
-	ic->ic_flags &= ~(IEEE80211_F_PSK | IEEE80211_F_RSNON);
+	ic->ic_flags &= ~(IEEE80211_F_PSK | IEEE80211_F_RSNON |
+	    IEEE80211_F_MFPR);
 	memset(ic->ic_psk, 0, sizeof(ic->ic_psk));
 	ic->ic_rsnprotos = 0;
 	ic->ic_rsnakms = 0;
@@ -684,6 +685,13 @@ ieee80211_ioctl(struct _ifnet *ifp, u_long cmd, caddr_t data)
 //			break;
 		ka = (struct ieee80211_keyavail *)data;
 		(void)ieee80211_pmksa_add(ic, IEEE80211_AKM_8021X,
+		    ka->i_macaddr, ka->i_key, ka->i_lifetime);
+		/*
+		 * WPA3-Enterprise commonly negotiates SHA256-based 802.1X AKM.
+		 * Cache PMKs for both AKM flavors so PMK lookup succeeds no
+		 * matter which 802.1X variant was selected for this BSS.
+		 */
+		(void)ieee80211_pmksa_add(ic, IEEE80211_AKM_SHA256_8021X,
 		    ka->i_macaddr, ka->i_key, ka->i_lifetime);
 		break;
 	case SIOCS80211KEYRUN:

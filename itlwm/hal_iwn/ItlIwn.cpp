@@ -507,6 +507,7 @@ iwn_attach(struct iwn_softc *sc, struct pci_attach_args *pa)
     ic->ic_caps =
         IEEE80211_C_WEP |        /* WEP */
         IEEE80211_C_RSN |        /* WPA/RSN */
+        IEEE80211_C_MFP |        /* PMF (802.11w) */
         IEEE80211_C_SCANALL |    /* device scans all channels at once */
         IEEE80211_C_SCANALLBAND |    /* driver scans all bands at once */
         IEEE80211_C_MONITOR |    /* monitor mode supported */

@@ -32,6 +32,8 @@ const IOControlMethodAction ItlNetworkUserClient::sMethods[IOCTL_ID_MAX] {
     sSCAN_RESULT,
     sTX_POWER_LEVEL,
     sNW_BSSID,
+    sKEYAVAIL,
+    sKEYRUN,
 };
 
 bool ItlNetworkUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties)
@@ -81,7 +83,7 @@ IOReturn ItlNetworkUserClient::externalMethod(uint32_t selector, IOExternalMetho
     bool isSet = selector & IOCTL_MASK;
     selector &= ~IOCTL_MASK;
 //    IOLog("externalMethod invoke. selector=0x%X isSet=%d\n", selector, isSet);
-    if (selector < 0 || selector > IOCTL_ID_MAX) {
+    if (selector >= IOCTL_ID_MAX) {
         return super::externalMethod(selector, arguments, NULL, this, NULL);
     }
     void *data = isSet ? (void *)arguments->structureInput : (void *)arguments->structureOutput;
@@ -398,6 +400,65 @@ sSCAN_RESULT(OSObject* target, void* data, bool isSet)
     if (that->fNextNodeToSend == NULL)
         that->fScanResultWrapping = true;
     return kIOReturnSuccess;
+}
+
+IOReturn ItlNetworkUserClient::
+sKEYAVAIL(OSObject* target, void* data, bool isSet)
+{
+    ItlNetworkUserClient *that = OSDynamicCast(ItlNetworkUserClient, target);
+    struct ioctl_keyavail *req = (struct ioctl_keyavail *)data;
+    struct ieee80211_keyavail ka;
+    struct ieee80211com *ic = that->fDriver->fHalService->get80211Controller();
+    static const uint8_t zero_bssid[ETHER_ADDR_LEN] = {0};
+    int error;
+
+    if (!isSet)
+        return kIOReturnError;
+    if (req->version != IOCTL_VERSION)
+        return kIOReturnBadArgument;
+
+    memset(&ka, 0, sizeof(ka));
+    memcpy(ka.i_macaddr, req->bssid, ETHER_ADDR_LEN);
+    if (memcmp(ka.i_macaddr, zero_bssid, ETHER_ADDR_LEN) == 0 &&
+        ic->ic_bss != NULL) {
+        memcpy(ka.i_macaddr, ic->ic_bss->ni_bssid, ETHER_ADDR_LEN);
+    }
+    if (memcmp(ka.i_macaddr, zero_bssid, ETHER_ADDR_LEN) == 0)
+        return kIOReturnBadArgument;
+
+    memcpy(ka.i_key, req->pmk, sizeof(ka.i_key));
+    ka.i_lifetime = req->lifetime;
+
+    error = (*that->fIfp->if_ioctl)(that->fIfp, SIOCS80211KEYAVAIL,
+                                    (caddr_t)&ka);
+    return error == 0 ? kIOReturnSuccess : kIOReturnError;
+}
+
+IOReturn ItlNetworkUserClient::
+sKEYRUN(OSObject* target, void* data, bool isSet)
+{
+    ItlNetworkUserClient *that = OSDynamicCast(ItlNetworkUserClient, target);
+    struct ioctl_keyrun *req = (struct ioctl_keyrun *)data;
+    struct ieee80211_keyrun kr;
+    struct ieee80211com *ic = that->fDriver->fHalService->get80211Controller();
+    static const uint8_t zero_bssid[ETHER_ADDR_LEN] = {0};
+    int error;
+
+    if (!isSet)
+        return kIOReturnError;
+    if (req->version != IOCTL_VERSION)
+        return kIOReturnBadArgument;
+
+    memset(&kr, 0, sizeof(kr));
+    memcpy(kr.i_macaddr, req->bssid, ETHER_ADDR_LEN);
+    if (memcmp(kr.i_macaddr, zero_bssid, ETHER_ADDR_LEN) == 0 &&
+        ic->ic_bss != NULL) {
+        memcpy(kr.i_macaddr, ic->ic_bss->ni_bssid, ETHER_ADDR_LEN);
+    }
+
+    error = (*that->fIfp->if_ioctl)(that->fIfp, SIOCS80211KEYRUN,
+                                    (caddr_t)&kr);
+    return error == 0 ? kIOReturnSuccess : kIOReturnError;
 }
 
 IOReturn ItlNetworkUserClient::

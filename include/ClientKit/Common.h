@@ -21,6 +21,7 @@
 #define IOCTL_VERSION 1
 #define NWID_LEN 32
 #define WPA_KEY_LEN 128
+#define PMK_KEY_LEN 32
 
 #define kIONoScanResult 20008
 
@@ -119,6 +120,17 @@ struct ioctl_tx_power {
     unsigned int version;
 };
 
+struct ioctl_keyavail {
+    unsigned int version;
+    uint8_t bssid[ETHER_ADDR_LEN];
+    uint8_t pmk[PMK_KEY_LEN];
+    uint32_t lifetime;
+};
+
+struct ioctl_keyrun {
+    unsigned int version;
+    uint8_t bssid[ETHER_ADDR_LEN];
+};
 /*
  * 802.11 ciphers.
  */

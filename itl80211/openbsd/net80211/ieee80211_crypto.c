@@ -683,9 +683,12 @@ ieee80211_pmksa_find(struct ieee80211com *ic, struct ieee80211_node *ni,
     const u_int8_t *pmkid)
 {
 	struct ieee80211_pmk *pmk;
+	enum ieee80211_akm ni_akm = (enum ieee80211_akm)ni->ni_rsnakms;
 
 	TAILQ_FOREACH(pmk, &ic->ic_pmksa, pmk_next) {
-        if (pmk->pmk_akm == ni->ni_rsnakms &&
+        if ((pmk->pmk_akm == ni_akm ||
+             (ieee80211_is_8021x_akm(pmk->pmk_akm) &&
+              ieee80211_is_8021x_akm(ni_akm))) &&
             IEEE80211_ADDR_EQ(pmk->pmk_macaddr, ni->ni_macaddr) &&
             (pmkid == NULL ||
              memcmp(pmk->pmk_pmkid, pmkid, IEEE80211_PMKID_LEN) == 0))

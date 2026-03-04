@@ -30,6 +30,80 @@ OSDefineMetaClassAndStructors(CTimeout, OSObject)
 IOWorkLoop *_fWorkloop;
 IOCommandGate *_fCommandGate;
 
+enum itlwm_auth_mode {
+    ITLWM_AUTH_OPEN = 0,
+    ITLWM_AUTH_PSK,
+    ITLWM_AUTH_ENTERPRISE
+};
+
+static struct ieee80211_node *
+itlwm_find_best_node_by_ssid(struct ieee80211com *ic, const char *ssid,
+                             size_t ssid_len)
+{
+    struct ieee80211_node *ni, *best = NULL;
+
+    if (ssid_len == 0)
+        return NULL;
+
+    RB_FOREACH(ni, ieee80211_tree, &ic->ic_tree) {
+        if (ni->ni_esslen != ssid_len)
+            continue;
+        if (memcmp(ni->ni_essid, ssid, ssid_len) != 0)
+            continue;
+        if (best == NULL || ni->ni_rssi > best->ni_rssi)
+            best = ni;
+    }
+
+    return best;
+}
+
+static u_int
+itlwm_get_supported_akms(const struct ieee80211_node *ni)
+{
+    if (ni == NULL)
+        return 0;
+    if (ni->ni_supported_rsnakms != 0)
+        return ni->ni_supported_rsnakms;
+    return ni->ni_rsnakms;
+}
+
+static enum itlwm_auth_mode
+itlwm_choose_auth_mode(const struct ieee80211_node *ni, size_t passlen)
+{
+    const u_int ap_akms = itlwm_get_supported_akms(ni);
+    const bool ap_has_enterprise = (ap_akms &
+        (IEEE80211_AKM_8021X | IEEE80211_AKM_SHA256_8021X)) != 0;
+    const bool ap_has_psk = (ap_akms &
+        (IEEE80211_AKM_PSK | IEEE80211_AKM_SHA256_PSK)) != 0;
+    const bool ap_is_protected = ni != NULL &&
+        (ni->ni_capinfo & IEEE80211_CAPINFO_PRIVACY) != 0;
+
+    if (ap_has_enterprise && (passlen == 0 || !ap_has_psk ||
+                              passlen < 8 || passlen > 63))
+        return ITLWM_AUTH_ENTERPRISE;
+    if (passlen > 0)
+        return ITLWM_AUTH_PSK;
+    if (ap_is_protected && ap_has_enterprise)
+        return ITLWM_AUTH_ENTERPRISE;
+    return ITLWM_AUTH_OPEN;
+}
+
+static void
+itlwm_setup_wpa_params(struct ieee80211_wpaparams *wpa, bool enterprise)
+{
+    memset(wpa, 0, sizeof(*wpa));
+    wpa->i_enabled = 1;
+    wpa->i_ciphers = 0;
+    wpa->i_groupcipher = 0;
+    wpa->i_protos = enterprise ? IEEE80211_WPA_PROTO_WPA2
+                               : (IEEE80211_WPA_PROTO_WPA1 |
+                                  IEEE80211_WPA_PROTO_WPA2);
+    wpa->i_akms = enterprise
+        ? (IEEE80211_WPA_AKM_8021X | IEEE80211_WPA_AKM_SHA256_8021X)
+        : (IEEE80211_WPA_AKM_PSK | IEEE80211_WPA_AKM_SHA256_PSK);
+    memcpy(wpa->i_name, "zxy", strlen("zxy"));
+}
+
 bool itlwm::init(OSDictionary *properties)
 {
     return super::init(properties);
@@ -169,37 +243,55 @@ bool itlwm::createMediumTables(const IONetworkMedium **primary)
 void itlwm::joinSSID(const char *ssid_name, const char *ssid_pwd)
 {
     struct ieee80211com *ic = fHalService->get80211Controller();
-    
-    if (strlen(ssid_pwd) == 0) {
+    size_t ssid_len = strlen(ssid_name);
+    size_t passlen = strlen(ssid_pwd);
+    struct ieee80211_node *ap;
+    enum itlwm_auth_mode auth_mode;
+
+    if (ssid_len > IEEE80211_NWID_LEN)
+        ssid_len = IEEE80211_NWID_LEN;
+
+    ap = itlwm_find_best_node_by_ssid(ic, ssid_name, ssid_len);
+    auth_mode = itlwm_choose_auth_mode(ap, passlen);
+
+    if (auth_mode == ITLWM_AUTH_OPEN) {
+        ic->ic_flags &= ~IEEE80211_F_MFPR;
         memset(&nwkey, 0, sizeof(ieee80211_nwkey));
         nwkey.i_wepon = IEEE80211_NWKEY_OPEN;
         nwkey.i_defkid = 0;
-        memcpy(join.i_nwid, ssid_name, strlen(ssid_name));
-        join.i_len = strlen(ssid_name);
+        memset(&join, 0, sizeof(ieee80211_join));
+        memcpy(join.i_nwid, ssid_name, ssid_len);
+        join.i_len = ssid_len;
         join.i_flags = IEEE80211_JOIN_NWKEY;
     } else {
-        memset(&wpa, 0, sizeof(ieee80211_wpaparams));
-        wpa.i_enabled = 1;
-        wpa.i_ciphers = 0;
-        wpa.i_groupcipher = 0;
-        wpa.i_protos = IEEE80211_WPA_PROTO_WPA1 | IEEE80211_WPA_PROTO_WPA2;
-        wpa.i_akms = IEEE80211_WPA_AKM_PSK | IEEE80211_WPA_AKM_8021X | IEEE80211_WPA_AKM_SHA256_PSK | IEEE80211_WPA_AKM_SHA256_8021X;
-        memcpy(wpa.i_name, "zxy", strlen("zxy"));
+        bool enterprise = auth_mode == ITLWM_AUTH_ENTERPRISE;
+        uint32_t join_flags = IEEE80211_JOIN_ANY | IEEE80211_JOIN_WPA;
+        if (enterprise)
+            ic->ic_flags |= IEEE80211_F_MFPR;
+        else
+            ic->ic_flags &= ~IEEE80211_F_MFPR;
+
+        itlwm_setup_wpa_params(&wpa, enterprise);
         memset(&psk, 0, sizeof(ieee80211_wpapsk));
         memcpy(psk.i_name, "zxy", strlen("zxy"));
-        psk.i_enabled = 1;
-        pbkdf2_sha1(ssid_pwd, (const uint8_t*)ssid_name, strlen(ssid_name),
-                    4096, psk.i_psk , 32);
+        if (!enterprise) {
+            psk.i_enabled = 1;
+            pbkdf2_sha1(ssid_pwd, (const uint8_t*)ssid_name, ssid_len,
+                        4096, psk.i_psk , 32);
+            join_flags |= IEEE80211_JOIN_WPAPSK;
+        } else {
+            join_flags |= IEEE80211_JOIN_8021X;
+        }
         memset(&nwkey, 0, sizeof(ieee80211_nwkey));
         nwkey.i_wepon = 0;
         nwkey.i_defkid = 0;
         memset(&join, 0, sizeof(ieee80211_join));
         join.i_wpaparams = wpa;
         join.i_wpapsk = psk;
-        join.i_flags = IEEE80211_JOIN_WPAPSK | IEEE80211_JOIN_ANY | IEEE80211_JOIN_WPA | IEEE80211_JOIN_8021X;
+        join.i_flags = join_flags;
         join.i_nwkey = nwkey;
-        join.i_len = strlen(ssid_name);
-        memcpy(join.i_nwid, ssid_name, join.i_len);
+        join.i_len = ssid_len;
+        memcpy(join.i_nwid, ssid_name, ssid_len);
     }
     if (ieee80211_add_ess(ic, &join) == 0)
         ic->ic_flags |= IEEE80211_F_AUTO_JOIN;
@@ -208,40 +300,46 @@ void itlwm::joinSSID(const char *ssid_name, const char *ssid_pwd)
 void itlwm::associateSSID(const char *ssid, const char *pwd)
 {
     struct ieee80211com *ic = fHalService->get80211Controller();
-    if (strlen(pwd) == 0) {
-        memcpy(nwid.i_nwid, ssid, 32);
-        nwid.i_len = strlen((char *)nwid.i_nwid);
-        memset(ic->ic_des_essid, 0, IEEE80211_NWID_LEN);
-        ic->ic_des_esslen = nwid.i_len;
-        memcpy(ic->ic_des_essid, nwid.i_nwid, nwid.i_len);
-        if (ic->ic_des_esslen > 0) {
-            /* 'nwid' disables auto-join magic */
-            ic->ic_flags &= ~IEEE80211_F_AUTO_JOIN;
-        } else if (!TAILQ_EMPTY(&ic->ic_ess)) {
-            /* '-nwid' re-enables auto-join */
-            ic->ic_flags |= IEEE80211_F_AUTO_JOIN;
-        }
-        /* disable WPA/WEP */
-        ieee80211_disable_rsn(ic);
-        ieee80211_disable_wep(ic);
+    size_t ssid_len = strlen(ssid);
+    size_t passlen = strlen(pwd);
+    struct ieee80211_node *ap;
+    enum itlwm_auth_mode auth_mode;
+
+    if (ssid_len > IEEE80211_NWID_LEN)
+        ssid_len = IEEE80211_NWID_LEN;
+
+    ap = itlwm_find_best_node_by_ssid(ic, ssid, ssid_len);
+    auth_mode = itlwm_choose_auth_mode(ap, passlen);
+
+    memset(&nwid, 0, sizeof(nwid));
+    memcpy(nwid.i_nwid, ssid, ssid_len);
+    nwid.i_len = ssid_len;
+    memset(ic->ic_des_essid, 0, IEEE80211_NWID_LEN);
+    ic->ic_des_esslen = nwid.i_len;
+    memcpy(ic->ic_des_essid, nwid.i_nwid, nwid.i_len);
+    if (ic->ic_des_esslen > 0) {
+        /* 'nwid' disables auto-join magic */
+        ic->ic_flags &= ~IEEE80211_F_AUTO_JOIN;
+    } else if (!TAILQ_EMPTY(&ic->ic_ess)) {
+        /* '-nwid' re-enables auto-join */
+        ic->ic_flags |= IEEE80211_F_AUTO_JOIN;
+    }
+    /* disable WPA/WEP */
+    ieee80211_disable_rsn(ic);
+    ieee80211_disable_wep(ic);
+
+    if (auth_mode == ITLWM_AUTH_OPEN) {
+        ic->ic_flags &= ~IEEE80211_F_MFPR;
+        /* Keep RSN/WEP disabled for open networks. */
+    } else if (auth_mode == ITLWM_AUTH_ENTERPRISE) {
+        ic->ic_flags |= IEEE80211_F_MFPR;
+        ic->ic_flags &= ~IEEE80211_F_PSK;
+        memset(ic->ic_psk, 0, sizeof(ic->ic_psk));
+        itlwm_setup_wpa_params(&wpa, true);
+        ieee80211_ioctl_setwpaparms(ic, &wpa);
     } else {
+        ic->ic_flags &= ~IEEE80211_F_MFPR;
         memset(&psk, 0, sizeof(psk));
-        memcpy(nwid.i_nwid, ssid, 32);
-        nwid.i_len = strlen((char *)nwid.i_nwid);
-        memset(ic->ic_des_essid, 0, IEEE80211_NWID_LEN);
-        ic->ic_des_esslen = nwid.i_len;
-        memcpy(ic->ic_des_essid, nwid.i_nwid, nwid.i_len);
-        if (ic->ic_des_esslen > 0) {
-            /* 'nwid' disables auto-join magic */
-            ic->ic_flags &= ~IEEE80211_F_AUTO_JOIN;
-        } else if (!TAILQ_EMPTY(&ic->ic_ess)) {
-            /* '-nwid' re-enables auto-join */
-            ic->ic_flags |= IEEE80211_F_AUTO_JOIN;
-        }
-        /* disable WPA/WEP */
-        ieee80211_disable_rsn(ic);
-        ieee80211_disable_wep(ic);
-        size_t passlen = strlen(pwd);
         /* Parse a WPA passphrase */
         if (passlen < 8 || passlen > 63)
             XYLog("wpakey: passphrase must be between "
@@ -260,13 +358,8 @@ void itlwm::associateSSID(const char *ssid, const char *pwd)
             ic->ic_flags &= ~IEEE80211_F_PSK;
             memset(ic->ic_psk, 0, sizeof(ic->ic_psk));
         }
-        memset(&wpa, 0, sizeof(wpa));
-        ieee80211_ioctl_getwpaparms(ic, &wpa);
+        itlwm_setup_wpa_params(&wpa, false);
         wpa.i_enabled = psk.i_enabled;
-        wpa.i_ciphers = 0;
-        wpa.i_groupcipher = 0;
-        wpa.i_protos = IEEE80211_WPA_PROTO_WPA1 | IEEE80211_WPA_PROTO_WPA2;
-        wpa.i_akms = IEEE80211_WPA_AKM_PSK | IEEE80211_WPA_AKM_8021X | IEEE80211_WPA_AKM_SHA256_PSK | IEEE80211_WPA_AKM_SHA256_8021X;
         ieee80211_ioctl_setwpaparms(ic, &wpa);
     }
     if (ic->ic_state > IEEE80211_S_AUTH && ic->ic_bss != NULL)
